@@ -12,6 +12,7 @@ import io
 import json
 import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
@@ -254,13 +255,14 @@ def build_zoho_rows(file_name, data):
     return rows
 
 
-def build_excel(inv_df, items_df, tally_df, zoho_df):
+def build_excel(inv_df, items_df, tally_df, zoho_df, skipped_df):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         inv_df.to_excel(writer, sheet_name="Invoices", index=False)
         items_df.to_excel(writer, sheet_name="Line Items", index=False)
         tally_df.to_excel(writer, sheet_name="Tally Import", index=False)
         zoho_df.to_excel(writer, sheet_name="Zoho Books Import", index=False)
+        skipped_df.to_excel(writer, sheet_name="Skipped Files", index=False)
     buffer.seek(0)
     return buffer
 
@@ -385,6 +387,16 @@ try:
 except Exception:
     owner_key = ""
 
+
+def clear_all():
+    """Runs BEFORE the next script pass draws widgets, so the uploader
+    comes back genuinely empty. (An if-block after the uploader is too late.)"""
+    old = f"uploader_{st.session_state.uploader_key}"
+    st.session_state.pop(old, None)          # drop the old uploader's state
+    st.session_state.uploader_key += 1       # new key = brand-new empty widget
+    st.session_state.results = None
+    st.session_state.processed_sig = None
+
 with st.sidebar:
     st.header("\U0001F511 Setup")
     if owner_key:
@@ -421,47 +433,72 @@ if uploaded_files and not api_key:
     st.warning("Please add your Gemini API key in the sidebar first.")
 
 # ---------- Processing ----------
+# A "signature" of the current file set. If we've already processed exactly
+# these files, don't process them again (clicking Download re-runs the script).
+def files_signature(files):
+    return tuple(sorted((f.name, f.size) for f in files))
+
+
 if uploaded_files and api_key:
-    invoice_rows, all_items, tally_rows, zoho_rows = [], [], [], []
-    not_invoices, failures = [], []
+    sig = files_signature(uploaded_files)
 
-    progress = st.progress(0.0)
-    status = st.empty()
-    total = len(uploaded_files)
-    batch_start = time.time()
+    if st.session_state.get("processed_sig") != sig:
+        invoice_rows, all_items, tally_rows, zoho_rows = [], [], [], []
+        not_invoices, failures = [], []
 
-    for i, f in enumerate(uploaded_files, start=1):
-        file_start = time.time()
-        elapsed = int(time.time() - batch_start)
-        status.info(f"\u23F3 Processing {i} of {total}: **{f.name}** \u2014 elapsed {elapsed}s")
-        try:
-            data = extract_with_ai(api_key, f.getvalue(), mime_for(f.name))
-            if not data.get("is_invoice", False):
-                not_invoices.append((f.name, data.get("document_type") or "Not recognised"))
-            else:
-                invoice_rows.append(flatten(f.name, data))
-                for item in (data.get("line_items") or []):
-                    item = dict(item)
-                    item["Source file"] = f.name
-                    item["Invoice number"] = data.get("invoice_number", "")
-                    all_items.append(item)
-                tally_rows.extend(build_tally_rows(f.name, data))
-                zoho_rows.extend(build_zoho_rows(f.name, data))
-        except Exception as e:
-            failures.append((f.name, str(e)))
-        progress.progress(i / total)
-        time.sleep(1)
+        progress = st.progress(0.0)
+        status = st.empty()
+        total = len(uploaded_files)
+        batch_start = time.time()
+        done = 0
 
-    took = int(time.time() - batch_start)
-    status.empty()
-    progress.empty()
+        # Read bytes up-front (file handles aren't thread-safe)
+        payloads = [(f.name, f.getvalue(), mime_for(f.name)) for f in uploaded_files]
 
-    st.session_state.results = {
-        "invoices": invoice_rows, "items": all_items,
-        "tally": tally_rows, "zoho": zoho_rows,
-        "not_invoices": not_invoices, "failures": failures,
-        "total": total, "took": took,
-    }
+        status.info(f"\u23F3 Reading {total} file(s) in parallel\u2026")
+
+        # 3 at a time: fast, but stays inside the free tier's per-minute limit
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            future_map = {
+                pool.submit(extract_with_ai, api_key, blob, mime): name
+                for name, blob, mime in payloads
+            }
+            for future in as_completed(future_map):
+                name = future_map[future]
+                try:
+                    data = future.result()
+                    if not data.get("is_invoice", False):
+                        not_invoices.append(
+                            (name, data.get("document_type") or "Not recognised"))
+                    else:
+                        invoice_rows.append(flatten(name, data))
+                        for item in (data.get("line_items") or []):
+                            item = dict(item)
+                            item["Source file"] = name
+                            item["Invoice number"] = data.get("invoice_number", "")
+                            all_items.append(item)
+                        tally_rows.extend(build_tally_rows(name, data))
+                        zoho_rows.extend(build_zoho_rows(name, data))
+                except Exception as e:
+                    failures.append((name, str(e)))
+
+                done += 1
+                elapsed = int(time.time() - batch_start)
+                progress.progress(done / total)
+                status.info(f"\u23F3 Done {done} of {total} \u2014 {elapsed}s elapsed "
+                            f"(last: **{name}**)")
+
+        took = round(time.time() - batch_start, 1)
+        status.empty()
+        progress.empty()
+
+        st.session_state.results = {
+            "invoices": invoice_rows, "items": all_items,
+            "tally": tally_rows, "zoho": zoho_rows,
+            "not_invoices": not_invoices, "failures": failures,
+            "total": total, "took": took,
+        }
+        st.session_state.processed_sig = sig   # remember: don't redo these files
 
 # ---------- Results ----------
 res = st.session_state.results
@@ -482,12 +519,20 @@ if res:
         for name, err in fails:
             st.write(f"- **{name}** \u2014 {err}")
 
+    # Skipped files table (non-invoices + unreadable) -> its own Excel sheet
+    skipped_rows = [{"File name": n, "Detected as": d, "Status": "Not an invoice"}
+                    for n, d in not_inv]
+    skipped_rows += [{"File name": n, "Detected as": "Could not be read",
+                      "Status": f"Error: {e[:120]}"} for n, e in fails]
+    skipped_df = pd.DataFrame(skipped_rows) if skipped_rows else pd.DataFrame(
+        columns=["File name", "Detected as", "Status"])
+
     if inv:
         inv_df = pd.DataFrame(inv)
         items_df = pd.DataFrame(items) if items else pd.DataFrame()
         tally_df = pd.DataFrame(res["tally"])
         zoho_df = pd.DataFrame(res["zoho"])
-        excel_file = build_excel(inv_df, items_df, tally_df, zoho_df)
+        excel_file = build_excel(inv_df, items_df, tally_df, zoho_df, skipped_df)
 
         with action_box:
             st.download_button(
@@ -496,11 +541,8 @@ if res:
                 file_name="invoices_extracted.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            if st.button("\U0001F5D1\uFE0F  Clear all"):
-                st.session_state.uploader_key += 1
-                st.session_state.results = None
-                st.rerun()
-            st.caption("4 sheets: Invoices, Line Items, Tally, Zoho.")
+            st.button("\U0001F5D1\uFE0F  Clear all", on_click=clear_all, key="clear_main")
+            st.caption("5 sheets: Invoices, Line Items, Tally, Zoho, Skipped Files.")
 
         c1, c2, c3, c4 = st.columns(4)
         for col, icon, num, lbl in [
@@ -514,8 +556,9 @@ if res:
                          f'<div class="stat-lbl">{lbl}</div></div>', unsafe_allow_html=True)
         st.write("")
 
-        t1, t2, t3, t4 = st.tabs(["\U0001F4CB Invoices", "\U0001F4E6 Line Items",
-                                  "\U0001F4D2 Tally Import", "\U0001F4D7 Zoho Books Import"])
+        t1, t2, t3, t4, t5 = st.tabs(["\U0001F4CB Invoices", "\U0001F4E6 Line Items",
+                                      "\U0001F4D2 Tally Import", "\U0001F4D7 Zoho Books Import",
+                                      "\U0001F6AB Skipped Files"])
         with t1:
             st.dataframe(inv_df, use_container_width=True)
         with t2:
@@ -528,9 +571,9 @@ if res:
             st.caption("Bills \u2014 one row per line item. "
                        "Zoho Books: Purchases > Bills > More > Import Bills.")
             st.dataframe(zoho_df, use_container_width=True)
+        with t5:
+            st.caption("Files that were not invoices, or could not be read.")
+            st.dataframe(skipped_df, use_container_width=True)
     else:
         with action_box:
-            if st.button("\U0001F5D1\uFE0F  Clear all"):
-                st.session_state.uploader_key += 1
-                st.session_state.results = None
-                st.rerun()
+            st.button("\U0001F5D1\uFE0F  Clear all", on_click=clear_all, key="clear_alt")
